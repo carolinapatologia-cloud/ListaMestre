@@ -1,0 +1,135 @@
+!pip install python-docx pypdf google-auth-httplib2 -q
+
+import io
+import re
+import docx
+import pypdf
+import google.auth
+from google.colab import auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+PASTA_ID = 'link da pasta na nuvem'  
+
+
+LISTA_MESTRE_ID = 'link do arquivo a ser automatizado'
+
+# 2. Autenticação completa no ambiente Google
+print("🔐 Conectando à sua conta Google...")
+auth.authenticate_user()
+credenciais, _ = google.auth.default()
+
+drive_service = build('drive', 'v3', credentials=credenciais)
+sheets_service = build('sheets', 'v4', credentials=credenciais)
+
+def extrair_texto_docx(conteudo_bytes):
+    """Lê o texto de um arquivo do Word (.docx)"""
+    doc = docx.Document(io.BytesIO(conteudo_bytes))
+    texto = []
+    for paragrafo in doc.paragraphs:
+        texto.append(paragrafo.text)
+    for tabela in doc.tables:
+        for linha in tabela.rows:
+            for celula in linha.cells:
+                texto.append(celula.text)
+    return "\n".join(texto)
+
+try:
+    # 3. Ler a Lista Mestre atual para saber onde escrever
+    print("📊 Lendo a estrutura atual da 'Lista Mestre'...")
+    resultado_sheets = sheets_service.spreadsheets().values().get(
+        spreadsheetId=LISTA_MESTRE_ID,
+        range="'Lista Mestre'!A:B" # Lemos as colunas A e B para cruzar os dados
+    ).execute()
+    linhas_planilha = resultado_sheets.get('values', [])
+
+    if not linhas_planilha:
+        print("❌ Não foi possível ler os dados da aba 'Lista Mestre'. Verifique se o nome está correto.")
+    else:
+        # 4. Listar os arquivos da pasta da Qualidade
+        print("🔄 Listando os documentos da pasta para extração...")
+        query = f"'{PASTA_ID}' in parents and trashed = false"
+        resultados = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
+        itens = resultados.get('files', [])
+
+        print(f"📦 Iniciando atualização automatizada da Lista Mestre...\n")
+        print("====================================================")
+
+        for i, item in enumerate(itens, 1):
+            nome = item['name']
+            id_doc = item['id']
+            mime = item['mimeType']
+            
+            if "folder" in mime or "spreadsheet" in mime:
+                continue
+
+            # Limpa extensões do nome do arquivo para facilitar a busca na planilha
+            nome_limpo = re.sub(r'\.docx$', '', nome, flags=re.IGNORECASE).strip()
+            print(f"[{i}/{len(itens)}] Processando: {nome_limpo}")
+            
+            texto_completo = ""
+            campo_aplicacao = None
+
+            try:
+                # Extração do texto de acordo com o tipo
+                if "wordprocessingml" in mime:
+                    request = drive_service.files().get_media(fileId=id_doc)
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while done is False:
+                        status, done = downloader.next_chunk()
+                    texto_completo = extrair_texto_docx(fh.getvalue())
+                elif "apps.document" in mime:
+                    request = drive_service.files().export_media(fileId=id_doc, mimeType='application/pdf')
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while done is False:
+                        status, done = downloader.next_chunk()
+                    fh.seek(0)
+                    leitor = pypdf.PdfReader(fh)
+                    for pagina in leitor.pages:
+                        texto_completo += pagina.extract_text()
+
+                if texto_completo:
+                    padrao = r"3\.\s*CAMPO\s+DE\s+APLICAÇÃO[:\s]*(.*?)(?=\n\d\.\s+|\n[A-Z\s]{4,}|$)"
+                    resultado = re.search(padrao, texto_completo, re.DOTALL | re.IGNORECASE)
+                    if resultado:
+                        campo_aplicacao = resultado.group(1).strip()
+                        campo_aplicacao = re.sub(r'\s+', ' ', campo_aplicacao)
+
+            except Exception as e_file:
+                print(f"   ❌ Erro ao ler arquivo: {e_file}")
+
+            # 5. Se encontramos o treinamento, vamos descobrir em qual linha ele deve entrar
+            if campo_aplicacao:
+                linha_destino = None
+                for num_linha, linha in enumerate(linhas_planilha, 1):
+                    # Compara se o título da coluna B está contido ou é igual ao nome do arquivo
+                    if len(linha) > 1 and (linha[1].lower().strip() in nome_limpo.lower() or nome_limpo.lower() in linha[1].lower()):
+                        linha_destino = num_linha
+                        break
+                
+                if linha_destino:
+                    # Coluna G corresponde à célula G + número da linha
+                    range_celula = f"'Lista Mestre'!G{linha_destino}"
+                    corpo_atualizacao = {'values': [[campo_aplicacao]]}
+                    
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=LISTA_MESTRE_ID,
+                        range=range_celula,
+                        valueInputOption="RAW",
+                        body=corpo_atualizacao
+                    ).execute()
+                    print(f"   ✅ Coluna G Atualizada na Linha {linha_destino}!")
+                else:
+                    print(f"   ⚠ Documento não localizado pelo título na Planilha Lista Mestre.")
+            else:
+                print(f"   ❌ Campo de aplicação não identificado no texto.")
+
+        print("====================================================")
+        print("🎉 EXCELENTE! Toda a sua Lista Mestre foi alimentada e atualizada com sucesso!")
+
+except Exception as e:
+    print(f"❌ Erro crítico no processo: {e}")
